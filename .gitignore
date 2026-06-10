@@ -6,3 +6,4 @@ recordings/
 screenshots/
 exports/
 run.log
+models/*.task
