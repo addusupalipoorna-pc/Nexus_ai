@@ -7,3 +7,7 @@ screenshots/
 exports/
 run.log
 models/*.task
+models/*.pt
+build/
+dist/
+*.spec

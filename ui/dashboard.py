@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import Qt, pyqtSlot
+# Brain widget removed
 
 class DashboardPanel(QWidget):
     def __init__(self, parent=None):
@@ -192,6 +193,17 @@ class DashboardPanel(QWidget):
         stats_grid.addWidget(self.val_conf, 2, 1)
 
         panel_layout.addLayout(stats_grid)
+
+        # System Status Card
+        sys_title = QLabel("SYSTEM STATUS")
+        sys_title.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 13px; letter-spacing: 0.5px; border-bottom: 1px solid #334155; padding-bottom: 5px;")
+        panel_layout.addWidget(sys_title)
+
+        self.lbl_sys_status = QLabel("AI CORE: ONLINE")
+        self.lbl_sys_status.setFixedHeight(40)
+        self.lbl_sys_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_sys_status.setStyleSheet("color: #10B981; font-weight: bold; font-size: 14px; background-color: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px;")
+        panel_layout.addWidget(self.lbl_sys_status)
 
         # 2. Object Counter Card
         counter_label = QLabel("OBJECT COUNTS")

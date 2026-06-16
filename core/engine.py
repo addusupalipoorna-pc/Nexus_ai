@@ -12,6 +12,7 @@ from scipy.optimize import linear_sum_assignment
 from database.logger import DatabaseLogger
 from core.zones import IntrusionZone
 from ultralytics import YOLO
+from core.notifier import Notifier
 
 # Target Category Filtering
 TARGET_CLASSES = {
@@ -381,7 +382,61 @@ class SyntheticCapture:
     def release(self):
         pass
 
-# ================= AI INFERENCE ENGINE WORKER =================
+def draw_glowing_hud_box(frame, x1, y1, x2, y2, color, label_lines=None, progress=1.0):
+    """
+    Renders a high-fidelity cyberpunk/HUD-style glowing bounding box.
+    Features:
+      - Double-layer neon borders (outer thick, inner sharp)
+      - Dynamic, progressive corner brackets
+      - Translucent dark obsidian label backplate cards
+      - Left colored accent bars
+    """
+    h_f, w_f = frame.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w_f - 1, int(x2)), min(h_f - 1, int(y2))
+    
+    # 1. Double-layer neon border glow
+    fade_color = (int(color[0] * 0.25), int(color[1] * 0.25), int(color[2] * 0.25))
+    cv2.rectangle(frame, (x1, y1), (x2, y2), fade_color, 3, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+    
+    # 2. Glowing corner brackets
+    box_w, box_h = x2 - x1, y2 - y1
+    corner_len = min(16, int(box_w * 0.25), int(box_h * 0.25))
+    dx = int(corner_len + (box_w / 2 - corner_len) * progress)
+    dy = int(corner_len + (box_h / 2 - corner_len) * progress)
+    
+    # Top Left
+    cv2.line(frame, (x1, y1), (x1 + dx, y1), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x1, y1), (x1, y1 + dy), color, 2, cv2.LINE_AA)
+    # Top Right
+    cv2.line(frame, (x2, y1), (x2 - dx, y1), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x2, y1), (x2, y1 + dy), color, 2, cv2.LINE_AA)
+    # Bottom Left
+    cv2.line(frame, (x1, y2), (x1 + dx, y2), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x1, y2), (x1, y2 - dy), color, 2, cv2.LINE_AA)
+    # Bottom Right
+    cv2.line(frame, (x2, y2), (x2 - dx, y2), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x2, y2), (x2, y2 - dy), color, 2, cv2.LINE_AA)
+    
+    # 3. Label/Metadata Stack
+    if label_lines:
+        line_height = 13
+        total_height = len(label_lines) * line_height
+        
+        y_offset = y2 + 6
+        if y_offset + total_height > h_f - 10:
+            y_offset = y1 - total_height - 6
+            if y_offset < 10:
+                y_offset = y1 + 15
+                
+        for line in label_lines:
+            (t_w, t_h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+            cv2.rectangle(frame, (x1, y_offset - t_h - 2), (x1 + t_w + 8, y_offset + 3), (24, 19, 14), -1)
+            cv2.line(frame, (x1, y_offset - t_h - 2), (x1, y_offset + 3), color, 2, cv2.LINE_AA)
+            cv2.putText(frame, line, (x1 + 6, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+            y_offset += line_height
+
 
 class InferenceEngine(QThread):
     frame_ready = pyqtSignal(object, dict)  # Sends annotated frame and metadata payload
@@ -392,21 +447,38 @@ class InferenceEngine(QThread):
         super().__init__()
         self.db = db_logger
         
+        # Thread safety lock for drawings
+        import threading
+        self.canvas_lock = threading.Lock()
+        
+        # Framerate tracking
+        self.current_fps = 30.0
+        
+        # Last cursor tracking for smoothing
+        self.last_cursor = None
+        
         # Engine configurations
-        self.source_type = "synthetic"  # "synthetic", "webcam", "file", "rtsp"
+        self.source_type = "webcam"  # "synthetic", "webcam", "file", "rtsp"
         self.source_path = "0"
+        self.camera_backend = "auto"  # "auto", "msmf", "dshow"
         self.conf_threshold = 0.25
         
         # Toggles
         self.show_trails = True
         self.show_labels = True
         self.show_intrusion = True
+        self.multi_camera_mode = False
         self.is_running = False
         self.is_paused = False
         
         # Intrusion Zone
         self.intrusion_zone = IntrusionZone()
         self.is_intrusion_alarm = False
+        
+        # Heatmap and tracking animations
+        self.track_animations = {}
+        self.heatmap_accum = None
+        self.show_heatmap = False
         
         # Hardware Auto-Detect
         self.device = self._auto_detect_hardware()
@@ -421,33 +493,66 @@ class InferenceEngine(QThread):
         self.take_screenshot_flag = False
         self.screenshot_type = "annotated"
         
+        # Behavior & Face analytics
+        self.track_zone_timers = {}
+        self.face_registry_profiles = []
+        self.register_face_name = ""
+        self.notified_alerts = set()
+        
         # Folder structures
-        self.root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        import sys
+        self.is_frozen = getattr(sys, 'frozen', False)
+        if self.is_frozen:
+            self.bundle_dir = sys._MEIPASS
+            self.root_dir = os.path.dirname(sys.executable)
+        else:
+            self.bundle_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.root_dir = self.bundle_dir
+            
         self.recordings_dir = os.path.join(self.root_dir, "recordings")
         self.screenshots_dir = os.path.join(self.root_dir, "screenshots")
         os.makedirs(self.recordings_dir, exist_ok=True)
         os.makedirs(self.screenshots_dir, exist_ok=True)
 
-        # MediaPipe Hands and Face Mesh initialization
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
-        )
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=5,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        
+        # MediaPipe Tasks initialization
+        self.hand_detector = None
+        self.face_detector = None
+        try:
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            
+            hand_model_path = os.path.join(self.bundle_dir, "models", "hand_landmarker.task")
+            if os.path.exists(hand_model_path):
+                hand_base_options = python.BaseOptions(model_asset_path=hand_model_path)
+                hand_options = vision.HandLandmarkerOptions(
+                    base_options=hand_base_options,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.5,
+                    min_hand_presence_confidence=0.5
+                )
+                self.hand_detector = vision.HandLandmarker.create_from_options(hand_options)
+                
+            face_model_path = os.path.join(self.bundle_dir, "models", "face_landmarker.task")
+            if os.path.exists(face_model_path):
+                face_base_options = python.BaseOptions(model_asset_path=face_model_path)
+                face_options = vision.FaceLandmarkerOptions(
+                    base_options=face_base_options,
+                    num_faces=5,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5
+                )
+                self.face_detector = vision.FaceLandmarker.create_from_options(face_options)
+        except Exception as e:
+            print(f"[InferenceEngine] MediaPipe Tasks init failed: {e}")
+            
         # Air Writing Canvas State
+        self.air_writing_enabled = True  # ON by default — toggle via UI button
         self.draw_paths = []
         self.current_path = []
         self.cursor_point = None
         self.writing_mode = False
+        self.brush_color = (0, 255, 0)
+        self.brush_thickness = 4
 
     def _auto_detect_hardware(self) -> str:
         """Determines best acceleration available (CUDA, MPS, or CPU)."""
@@ -458,26 +563,46 @@ class InferenceEngine(QThread):
             return "mps"
         return "cpu"
 
+    def _trigger_audio_beep(self):
+        try:
+            import winsound
+            winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
     def apply_settings(self, config):
         """Applies dynamic runtime configurations."""
+        Notifier.configure(config)
         self.conf_threshold = config.get("conf_threshold", self.conf_threshold)
         self.show_trails = config.get("show_trails", self.show_trails)
         self.show_labels = config.get("show_labels", self.show_labels)
         self.show_intrusion = config.get("show_intrusion", self.show_intrusion)
+        self.multi_camera_mode = config.get("multi_camera", self.multi_camera_mode)
+        self.show_heatmap = config.get("show_heatmap", self.show_heatmap)
+        self.brush_color = config.get("brush_color", self.brush_color)
+        self.brush_thickness = config.get("brush_thickness", self.brush_thickness)
+        self.register_face_name = config.get("register_face_name", self.register_face_name)
+        if config.get("clear_canvas", False):
+            with self.canvas_lock:
+                self.draw_paths = []
+                self.current_path = []
         
         # Trigger video source restart if modified
         new_src_type = config.get("source_type", self.source_type)
         new_src_path = str(config.get("source_path", self.source_path))
+        new_backend = config.get("camera_backend", self.camera_backend)
         
-        if (new_src_type != self.source_type or new_src_path != self.source_path) and self.is_running:
+        if (new_src_type != self.source_type or new_src_path != self.source_path or new_backend != self.camera_backend) and self.is_running:
             self.status_msg.emit("Re-routing video source...")
             self.source_type = new_src_type
             self.source_path = new_src_path
+            self.camera_backend = new_backend
             # We signal loop to re-initialize camera capture stream
             self.restart_source_flag = True
         else:
             self.source_type = new_src_type
             self.source_path = new_src_path
+            self.camera_backend = new_backend
 
     def trigger_screenshot(self, s_type="annotated"):
         self.take_screenshot_flag = True
@@ -499,25 +624,62 @@ class InferenceEngine(QThread):
     def _load_yolo_model(self):
         if self.model is not None:
             return True
+        
+        # Bypass SSL verification checks globally for downloads in Python
+        import ssl
         try:
-            self.status_msg.emit(f"Loading YOLO Core ({self.device.upper()})...")
-            model_path = os.path.join(self.root_dir, "models", "yolov8n.pt")
+            ssl._create_default_https_context = ssl._create_unverified_context
+        except Exception:
+            pass
+
+        # Try to load yolo11n.pt first
+        try:
+            self.status_msg.emit(f"Loading YOLO11 Core ({self.device.upper()})...")
+            model_path = os.path.join(self.bundle_dir, "models", "yolo11n.pt")
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             self.model = YOLO(model_path)
             self.model.to(self.device)
-            self.status_msg.emit(f"YOLO engine online ({self.device.upper()}).")
+            self.status_msg.emit(f"YOLO11 engine online ({self.device.upper()}).")
             return True
         except Exception as e:
-            self.status_msg.emit(f"YOLO Init Failed: {e}. Falling back to synthetic source.")
-            self.source_type = "synthetic"
-            return False
+            print(f"[Engine] YOLO11 load failed: {e}. Attempting fallback to local YOLOv8...")
+            self.status_msg.emit("YOLO11 download/load failed. Loading local YOLOv8 fallback...")
+
+        # Fallback to yolov8n.pt which is already local in models/
+        try:
+            model_path = os.path.join(self.bundle_dir, "models", "yolov8n.pt")
+            if os.path.exists(model_path):
+                self.model = YOLO(model_path)
+                self.model.to(self.device)
+                self.status_msg.emit(f"YOLOv8 fallback engine online ({self.device.upper()}).")
+                return True
+            else:
+                self.status_msg.emit("YOLOv8 fallback model file not found.")
+        except Exception as ex:
+            print(f"[Engine] YOLOv8 fallback failed: {ex}")
+
+        self.status_msg.emit("YOLO Init Failed. Falling back to synthetic source.")
+        self.source_type = "synthetic"
+        return False
 
     def run(self):
+        try:
+            self._run_loop()
+        except Exception as fatal:
+            self.status_msg.emit(f"[FATAL] Engine thread crashed: {fatal}")
+            print(f"[Engine] FATAL unhandled exception in run(): {fatal}")
+            import traceback
+            traceback.print_exc()
+
+    def _run_loop(self):
         self.is_running = True
         self.is_paused = False
         self.restart_source_flag = False
         self.tracker = ByteTracker(track_thresh=self.conf_threshold)
-        
+
+        # Initialize Face registry profiles
+        self.face_registry_profiles = self.db.get_face_registry()
+
         # Initialize YOLO Model only if not synthetic
         if self.source_type != "synthetic":
             self._load_yolo_model()
@@ -525,9 +687,14 @@ class InferenceEngine(QThread):
         # Initialize Capture Stream
         cap = self._init_capture()
         sim_tick = 0
+        loop_cnt = 0
+        consecutive_drops = 0
         prev_time = time.time()
         
         while self.is_running:
+            loop_cnt += 1
+            if loop_cnt % 150 == 0:
+                self.face_registry_profiles = self.db.get_face_registry()
             if self.restart_source_flag:
                 self.restart_source_flag = False
                 if cap:
@@ -535,6 +702,7 @@ class InferenceEngine(QThread):
                 if self.source_type != "synthetic":
                     self._load_yolo_model()
                 cap = self._init_capture()
+                consecutive_drops = 0
                 
             if self.is_paused:
                 time.sleep(0.1)
@@ -557,6 +725,7 @@ class InferenceEngine(QThread):
                     self.status_msg.emit("Core Capture Offline. Re-initializing...")
                     time.sleep(1.0)
                     cap = self._init_capture()
+                    consecutive_drops = 0
                     continue
                     
                 ret, frame = cap.read()
@@ -565,33 +734,51 @@ class InferenceEngine(QThread):
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop file
                         continue
                     else:
-                        self.status_msg.emit("Capture Frame Drop. Attempting Recovery...")
-                        time.sleep(0.5)
+                        consecutive_drops += 1
+                        self.status_msg.emit(f"Capture Frame Drop ({consecutive_drops}/5). Attempting Recovery...")
+                        if consecutive_drops >= 5:
+                            self.status_msg.emit("Persistent frame drops. Re-initializing capture device...")
+                            if cap:
+                                cap.release()
+                            cap = None
+                            consecutive_drops = 0
+                            time.sleep(1.0)
+                        else:
+                            time.sleep(0.2)
                         continue
+                
+                # If frame is read successfully, reset drops
+                consecutive_drops = 0
+                
+                # Flip webcam horizontally for natural mirrored view
+                if self.source_type == "webcam":
+                    frame = cv2.flip(frame, 1)
                 
                 raw_frame = frame.copy()
                 
                 # 2. YOLO Model Prediction
                 try:
+                    if self.model is None:
+                        raise RuntimeError("YOLO model not loaded")
                     # Run FP16 inference on GPU
                     half_precision = (self.device == "cuda")
                     predict_results = self.model.predict(
                         source=frame,
                         conf=self.conf_threshold,
-                        classes=list(TARGET_CLASSES.keys()),
+                        classes=None,  # None loads all 80 COCO categories dynamically
                         half=half_precision,
                         device=self.device,
                         verbose=False
                     )
-                    
+
                     if predict_results:
                         boxes = predict_results[0].boxes
                         for box in boxes:
                             xyxy = box.xyxy[0].cpu().numpy()
                             score = float(box.conf[0].cpu().numpy())
                             cls_id = int(box.cls[0].cpu().numpy())
-                            label = TARGET_CLASSES.get(cls_id, "unknown")
-                            
+                            label = self.model.names.get(cls_id, "unknown")
+
                             yolo_results.append({
                                 'box': [float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])],
                                 'score': score,
@@ -600,8 +787,27 @@ class InferenceEngine(QThread):
                 except Exception as e:
                     self.status_msg.emit(f"Model Inference Failure: {e}")
 
+            # 3. Guard: skip this loop iteration if frame is None
+            if frame is None:
+                time.sleep(0.03)
+                continue
+
             # 3. Process ByteTrack
             active_tracks = self.tracker.update(yolo_results)
+            h, w, _ = frame.shape
+            
+            # Heatmap accumulation
+            if self.show_heatmap:
+                if self.heatmap_accum is None or self.heatmap_accum.shape[:2] != frame.shape[:2]:
+                    self.heatmap_accum = np.zeros(frame.shape[:2], dtype=np.float32)
+                
+                self.heatmap_accum *= 0.98 # decay factor
+                for track in active_tracks:
+                    tlbr = track.to_tlbr().astype(int)
+                    cx = int((tlbr[0] + tlbr[2]) // 2)
+                    cy = int((tlbr[1] + tlbr[3]) // 2)
+                    # Accumulate density within a radius of 30 pixels
+                    cv2.circle(self.heatmap_accum, (cx, cy), 30, 0.5, -1)
             
             inference_latency = (time.time() - start_inference_time) * 1000.0
             
@@ -621,27 +827,109 @@ class InferenceEngine(QThread):
                     if is_intruding:
                         self.is_intrusion_alarm = True
                         
+                # 1. Behavior: Loitering Detection
+                behavior = "normal"
+                if is_intruding:
+                    if track.track_id not in self.track_zone_timers:
+                        self.track_zone_timers[track.track_id] = time.time()
+                    elapsed = time.time() - self.track_zone_timers[track.track_id]
+                    if elapsed > 10.0:
+                        behavior = "loitering"
+                else:
+                    self.track_zone_timers.pop(track.track_id, None)
+                    
+                # 2. Behavior: Running Detection
+                if len(track.history) >= 10:
+                    p_old = track.history[-10]
+                    p_new = track.history[-1]
+                    dist = np.sqrt((p_new[0] - p_old[0])**2 + (p_new[1] - p_old[1])**2)
+                    speed = dist / 10.0
+                    if speed > 12.0:
+                        behavior = "running"
+                        
                 active_metadata[track.track_id] = {
                     "bbox": tlwh.tolist(),
                     "class": class_label,
                     "confidence": float(track.score),
-                    "intrusion": is_intruding
+                    "intrusion": is_intruding,
+                    "behavior": behavior,
+                    "user_name": "Unknown"
                 }
+
+                # Trigger alerts
+                # A. Intrusion Alert
+                if is_intruding:
+                    alert_key = f"intrusion_{track.track_id}"
+                    if alert_key not in self.notified_alerts:
+                        self.notified_alerts.add(alert_key)
+                        alert_msg = f"Security Violation: Object ID {track.track_id} ({class_label}) entered the restricted intrusion zone."
+                        Notifier.send_telegram(alert_msg)
+                        Notifier.send_email(f"Intrusion Alert (ID: {track.track_id})", alert_msg)
+                        self._trigger_audio_beep()
+                
+                # B. Loitering Alert
+                if behavior == "loitering":
+                    alert_key = f"loitering_{track.track_id}"
+                    if alert_key not in self.notified_alerts:
+                        self.notified_alerts.add(alert_key)
+                        alert_msg = f"Loitering Violation: Object ID {track.track_id} ({class_label}) has loitered in the intrusion zone for over 10 seconds."
+                        Notifier.send_telegram(alert_msg)
+                        Notifier.send_email(f"Loitering Alert (ID: {track.track_id})", alert_msg)
+                        self._trigger_audio_beep()
+                
+                # C. Running Alert
+                if behavior == "running":
+                    alert_key = f"running_{track.track_id}"
+                    if alert_key not in self.notified_alerts:
+                        self.notified_alerts.add(alert_key)
+                        alert_msg = f"Behavior Alert: Object ID {track.track_id} ({class_label}) is running at high speed."
+                        Notifier.send_telegram(alert_msg)
+                        Notifier.send_email(f"Running Behavior Alert (ID: {track.track_id})", alert_msg)
+                        self._trigger_audio_beep()
+                
+            # Clean up notified alerts for tracks that are no longer active
+            active_track_ids = {track.track_id for track in active_tracks}
+            keys_to_remove = []
+            for key in list(self.notified_alerts):
+                try:
+                    parts = key.split('_')
+                    if len(parts) >= 2:
+                        tid = int(parts[-1])
+                        if tid not in active_track_ids:
+                            keys_to_remove.append(key)
+                except ValueError:
+                    pass
+            for key in keys_to_remove:
+                self.notified_alerts.discard(key)
                 
             # Process MediaPipe models on live camera
             annotated_frame = frame.copy()
             if self.source_type != "synthetic":
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 self._process_mood_detection(frame_rgb, annotated_frame, active_metadata)
-                self._process_hand_writing(frame_rgb, annotated_frame)
+                if self.air_writing_enabled:
+                    self._process_hand_writing(frame_rgb, annotated_frame)
+                else:
+                    self._render_drawings(annotated_frame)
+            else:
+                self._render_drawings(annotated_frame)
                 
-            # Now build db_inserts, using custom mood-augmented labels for persons
+            # Now build db_inserts, using custom mood/behavior-augmented labels for persons
             for track in active_tracks:
                 if track.hits == 2 or (track.hits % 30 == 0):
                     meta = active_metadata.get(track.track_id)
                     logged_label = track.class_id
-                    if meta and "mood" in meta and logged_label == "person":
-                        logged_label = f"person ({meta['mood'].lower()})"
+                    if meta and logged_label == "person":
+                        annotations = []
+                        if "user_name" in meta and meta["user_name"] != "Unknown":
+                            annotations.append(meta["user_name"].lower())
+                        if "behavior" in meta and meta["behavior"] != "normal":
+                            annotations.append(meta["behavior"])
+                        if "mood" in meta:
+                            annotations.append(meta["mood"].lower())
+                        
+                        if annotations:
+                            logged_label = f"person ({' - '.join(annotations)})"
                     db_inserts.append((logged_label, track.track_id, float(track.score)))
 
             # Batch push to SQLite Logger Queue
@@ -653,17 +941,61 @@ class InferenceEngine(QThread):
             fps = 1.0 / (curr_time - prev_time + 1e-6)
             prev_time = curr_time
             
+            # Smooth current FPS running average
+            self.current_fps = 0.9 * self.current_fps + 0.1 * fps
+            
             # Emit live latency & FPS signals
             self.telemetry_ready.emit(inference_latency, fps)
 
             # 5. Visual Render Overlay Layouts
             
+            # Heatmap Superimpose Blend
+            if self.show_heatmap and self.heatmap_accum is not None:
+                heatmap_norm = np.clip(self.heatmap_accum * 255.0, 0, 255).astype(np.uint8)
+                heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+                # Blend heatmap color map onto the annotated frame at 0.3 opacity
+                cv2.addWeighted(heatmap_color, 0.3, annotated_frame, 0.7, 0, annotated_frame)
+                
             # A. Draw Intrusion Zone overlay
             if self.show_intrusion:
                 self.intrusion_zone.draw_zone(annotated_frame, self.is_intrusion_alarm)
                 
             # B. Draw Tracks and Gradient Trails
             self._render_tracks(annotated_frame, active_tracks, active_metadata)
+            
+            # C. Multi-Camera Grid Wall Composition
+            if self.multi_camera_mode:
+                h_half, w_half = h // 2, w // 2
+                
+                f1 = cv2.resize(annotated_frame, (w_half, h_half))
+                cv2.putText(f1, "FEED 01 // PRIMARY OPTICAL", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 229, 255), 1, cv2.LINE_AA)
+                
+                # Feed 2: Synthetic Simulator
+                f2_raw, _ = self._generate_synthetic_frame(sim_tick)
+                f2 = cv2.resize(f2_raw, (w_half, h_half))
+                cv2.putText(f2, "FEED 02 // SYNTHETIC TARGETING", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 229, 255), 1, cv2.LINE_AA)
+                
+                # Feed 3: Thermal representation
+                f3_raw = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+                f3_colored = cv2.applyColorMap(f3_raw, cv2.COLORMAP_JET)
+                f3 = cv2.resize(f3_colored, (w_half, h_half))
+                cv2.putText(f3, "FEED 03 // THERMAL SPECTRUM", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 229, 255), 1, cv2.LINE_AA)
+                
+                # Feed 4: System Vector Radar Scan
+                f4 = np.zeros((h_half, w_half, 3), dtype=np.uint8)
+                f4[:, :] = [12, 16, 24] # Dark Slate Grey
+                sweep_x = int((sim_tick * 4) % w_half)
+                cv2.line(f4, (sweep_x, 0), (sweep_x, h_half), (0, 229, 255), 1)
+                for gx in range(0, w_half, 40):
+                    cv2.line(f4, (gx, 0), (gx, h_half), (30, 41, 59), 1)
+                for gy in range(0, h_half, 40):
+                    cv2.line(f4, (0, gy), (w_half, gy), (30, 41, 59), 1)
+                cv2.putText(f4, "FEED 04 // DIAGNOSTIC RADAR", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 229, 255), 1, cv2.LINE_AA)
+                cv2.putText(f4, f"RADAR SCAN POS: {sweep_x}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
+                
+                top_row = np.hstack((f1, f2))
+                bottom_row = np.hstack((f3, f4))
+                annotated_frame = np.vstack((top_row, bottom_row))
             
             # Save screenshots
             if self.take_screenshot_flag:
@@ -690,25 +1022,83 @@ class InferenceEngine(QThread):
             self.video_writer.release()
 
     def _init_capture(self):
-        """Initializes OpenCV Video Capture based on source settings."""
+        """Initializes OpenCV Video Capture based on source settings.
+        
+        Enhanced with multi-index and multi-backend fallback for maximum
+        compatibility when launched from different environments (IDE, batch file,
+        double-click, etc.).
+        """
         if self.source_type == "synthetic":
             return SyntheticCapture()
         elif self.source_type == "webcam":
             try:
-                idx = int(self.source_path)
+                preferred_idx = int(self.source_path)
             except ValueError:
-                idx = 0
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                self.status_msg.emit(f"Webcam {idx} Connected successfully.")
-                return cap
+                preferred_idx = 0
+
+            # Build ordered list of (camera_index, backend) tuples to try.
+            # We try preferred idx first across all backends, then fallback indices.
+            candidate_indices = [preferred_idx]
+            for alt in range(4):
+                if alt != preferred_idx:
+                    candidate_indices.append(alt)
+
+            # Backend preference order: CAP_DSHOW (fastest on Windows),
+            # then default (auto), then CAP_MSMF as last resort.
+            dshow_val = getattr(cv2, "CAP_DSHOW", 700)
+            msmf_val  = getattr(cv2, "CAP_MSMF",  1400)
+
+            for cam_idx in candidate_indices:
+                if self.camera_backend == "dshow":
+                    backends = [(cam_idx, dshow_val, f"CAP_DSHOW@{cam_idx}")]
+                elif self.camera_backend == "msmf":
+                    backends = [(cam_idx, msmf_val, f"CAP_MSMF@{cam_idx}")]
+                else:  # auto
+                    backends = [
+                        (cam_idx, None,      f"DEFAULT@{cam_idx}"),
+                        (cam_idx, msmf_val,  f"CAP_MSMF@{cam_idx}"),
+                        (cam_idx, dshow_val, f"CAP_DSHOW@{cam_idx}"),
+                    ]
+                for cam_val, api_val, backend_name in backends:
+                    try:
+                        self.status_msg.emit(f"Trying camera {backend_name}...")
+                        if api_val is not None:
+                            cap = cv2.VideoCapture(cam_val, api_val)
+                        else:
+                            cap = cv2.VideoCapture(cam_val)
+                        if cap.isOpened():
+                            # Verify we can actually read multiple frames (some cameras
+                            # report isOpened=True but fail on subsequent reads).
+                            success = True
+                            for _ in range(3):
+                                ret, test_frame = cap.read()
+                                if not ret or test_frame is None:
+                                    success = False
+                                    break
+                                time.sleep(0.01)
+                            
+                            if success:
+                                self.source_path = str(cam_idx)
+                                self.status_msg.emit(
+                                    f"Camera online: index={cam_idx} backend={backend_name}."
+                                )
+                                return cap
+                            else:
+                                cap.release()
+                    except Exception as e:
+                        print(f"[Engine] Camera probe failed ({backend_name}): {e}")
+
+
         elif self.source_type in ["file", "rtsp"]:
             cap = cv2.VideoCapture(self.source_path)
             if cap.isOpened():
                 self.status_msg.emit(f"Stream {self.source_path} Connected successfully.")
                 return cap
-                
-        self.status_msg.emit("Failed to open video source. Falling back to Synthetic Simulator.")
+
+        self.status_msg.emit(
+            "No camera found. Falling back to Synthetic Simulator. "
+            "Check that your webcam is plugged in and not used by another app."
+        )
         self.source_type = "synthetic"
         return SyntheticCapture()
 
@@ -720,9 +1110,14 @@ class InferenceEngine(QThread):
                 continue
                 
             tlbr = track.to_tlbr().astype(int)
+            w = tlbr[2] - tlbr[0]
+            h = tlbr[3] - tlbr[1]
+            if w <= 0 or h <= 0:
+                continue
+                
             is_intruding = meta["intrusion"]
             
-            # Neon Crimson for Intrusion Zone violators, Electric Cyan for normal states
+            # Neon Crimson for Intrusion Zone violators, Electric Cyan/Blue for normal states
             color = (60, 0, 255) if is_intruding else (255, 229, 0)
             
             # A. Draw Gradient Trailing Trails
@@ -739,127 +1134,200 @@ class InferenceEngine(QThread):
                     # Draw fading trail segment
                     cv2.line(frame, pt1, pt2, color, thickness, lineType=cv2.LINE_AA)
 
-            # B. Draw Bounding Box HUD Outline
-            cv2.rectangle(frame, (tlbr[0], tlbr[1]), (tlbr[2], tlbr[3]), color, 2)
-            
-            # Corner HUD highlights
-            corner_len = min(20, int((tlbr[2]-tlbr[0])*0.2))
-            # Corners outline
-            cv2.line(frame, (tlbr[0], tlbr[1]), (tlbr[0] + corner_len, tlbr[1]), color, 4)
-            cv2.line(frame, (tlbr[0], tlbr[1]), (tlbr[0], tlbr[1] + corner_len), color, 4)
-            cv2.line(frame, (tlbr[2], tlbr[1]), (tlbr[2] - corner_len, tlbr[1]), color, 4)
-            cv2.line(frame, (tlbr[2], tlbr[1]), (tlbr[2], tlbr[1] + corner_len), color, 4)
-            cv2.line(frame, (tlbr[0], tlbr[3]), (tlbr[0] + corner_len, tlbr[3]), color, 4)
-            cv2.line(frame, (tlbr[0], tlbr[3]), (tlbr[0], tlbr[3] - corner_len), color, 4)
-            cv2.line(frame, (tlbr[2], tlbr[3]), (tlbr[2] - corner_len, tlbr[3]), color, 4)
-            cv2.line(frame, (tlbr[2], tlbr[3]), (tlbr[2], tlbr[3] - corner_len), color, 4)
-
-            # C. Draw labels on screen
-            if self.show_labels:
-                label_text = f"{meta['class'].upper()} ID: {track.track_id} [{int(meta['confidence']*100)}%]"
-                (t_w, t_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            # Initialize track-specific animation state if not exists
+            if track.track_id not in self.track_animations:
+                self.track_animations[track.track_id] = {
+                    'progress': 0.0,
+                    'conf': 0.1
+                }
                 
-                # Draw filled banner tag
-                cv2.rectangle(frame, (tlbr[0], tlbr[1] - t_h - 10), (tlbr[0] + t_w + 10, tlbr[1]), color, -1)
-                cv2.putText(frame, label_text, (tlbr[0] + 5, tlbr[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            anim = self.track_animations[track.track_id]
+            # Speed of bounding box drawing
+            anim['progress'] = min(1.0, anim['progress'] + 0.08)
+            # Speed of confidence count-up
+            target_conf = float(meta['confidence'])
+            anim['conf'] = min(target_conf, anim['conf'] + (target_conf - anim['conf']) * 0.15)
+
+            # B. Draw Bounding Box HUD Outline & Labels
+            label_lines = None
+            if self.show_labels:
+                label_lines = [f"{meta['class'].upper()} ID: {track.track_id}"]
+                conf_val = int(anim['conf'] * 100)
+                if 'user_name' in meta and meta['user_name'] != 'Unknown':
+                    label_lines.append(f"USER: {meta['user_name'].upper()} [{conf_val}%]")
+                else:
+                    label_lines.append(f"CONFIDENCE: {conf_val}%")
+                    
+                if 'behavior' in meta and meta['behavior'] != 'normal':
+                    label_lines.append(f"BEHAVIOR: {meta['behavior'].upper()}")
+                    
+                if 'mood' in meta:
+                    label_lines.append(f"MOOD: {meta['mood'].upper()}")
+
+            draw_glowing_hud_box(
+                frame, 
+                tlbr[0], tlbr[1], tlbr[2], tlbr[3], 
+                color, 
+                label_lines, 
+                anim['progress']
+            )
+
+        # Cleanup cached animation profiles for tracks no longer active
+        active_ids = {track.track_id for track in tracks}
+        for tid in list(self.track_animations.keys()):
+            if tid not in active_ids:
+                self.track_animations.pop(tid, None)
+
+    def _draw_hud_cursor(self, frame, center, color, writing=False):
+        """Draws a premium cybernetic reticle cursor on the screen."""
+        cx, cy = center
+        # Center dot
+        cv2.circle(frame, (cx, cy), 2, color, -1)
+        # Outer ring
+        cv2.circle(frame, (cx, cy), 10, color, 1, lineType=cv2.LINE_AA)
+        
+        # Crosshair lines
+        cv2.line(frame, (cx - 15, cy), (cx - 5, cy), color, 1)
+        cv2.line(frame, (cx + 5, cy), (cx + 15, cy), color, 1)
+        cv2.line(frame, (cx, cy - 15), (cx, cy - 5), color, 1)
+        cv2.line(frame, (cx, cy + 5), (cx, cy + 15), color, 1)
+        
+        # Cursor Mode Label Text
+        label = "WRITE" if writing else "HOVER"
+        cv2.putText(frame, label, (cx + 18, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
     def _process_hand_writing(self, frame_rgb, annotated_frame):
-        # Run MediaPipe Hands
+        if self.hand_detector is None:
+            return
+        # Run MediaPipe Hands via Tasks API
         h, w, _ = annotated_frame.shape
-        results = self.hands.process(frame_rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        results = self.hand_detector.detect(mp_image)
         
         self.cursor_point = None
         
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                landmarks = hand_landmarks.landmark
+        if results.hand_landmarks:
+            for hand_landmarks in results.hand_landmarks:
+                landmarks = hand_landmarks
                 
-                # Check if index finger is extended
+                # Robust 3D distance check relative to wrist (landmark 0)
+                def is_finger_extended(pip_idx, tip_idx):
+                    p_wrist = landmarks[0]
+                    p_pip = landmarks[pip_idx]
+                    p_tip = landmarks[tip_idx]
+                    d_tip = np.sqrt((p_tip.x - p_wrist.x)**2 + (p_tip.y - p_wrist.y)**2 + (p_tip.z - p_wrist.z)**2)
+                    d_pip = np.sqrt((p_pip.x - p_wrist.x)**2 + (p_pip.y - p_wrist.y)**2 + (p_pip.z - p_wrist.z)**2)
+                    return d_tip > d_pip
+                
                 index_tip = landmarks[8]
-                index_pip = landmarks[6]
-                index_extended = index_tip.y < index_pip.y
-                
-                # Check if middle finger is extended
-                middle_tip = landmarks[12]
-                middle_pip = landmarks[10]
-                middle_extended = middle_tip.y < middle_pip.y
-                
-                # Check if ring finger and pinky are extended
-                ring_extended = landmarks[16].y < landmarks[14].y
-                pinky_extended = landmarks[20].y < landmarks[18].y
+                index_extended = is_finger_extended(6, 8)
+                middle_extended = is_finger_extended(10, 12)
+                ring_extended = is_finger_extended(14, 16)
                 
                 # Coordinates of index tip
                 ix, iy = int(index_tip.x * w), int(index_tip.y * h)
+                
+                # Apply smoothing filter (exponential moving average) to reduce jitter
+                if self.last_cursor is not None:
+                    dist = np.sqrt((ix - self.last_cursor[0])**2 + (iy - self.last_cursor[1])**2)
+                    if dist < 150: # Smooth only small jitters, don't lag on big jumps
+                        ix = int(self.last_cursor[0] * 0.75 + ix * 0.25)
+                        iy = int(self.last_cursor[1] * 0.75 + iy * 0.25)
+                        
+                self.last_cursor = (ix, iy)
                 self.cursor_point = (ix, iy)
                 
-                # Determine mode:
-                # 1. Writing Mode: Only Index Finger is extended, middle and others are closed.
-                if index_extended and not middle_extended and not ring_extended and not pinky_extended:
+                # Determine mode using robust three-finger system:
+                # 1. Writing Mode: Index extended, Middle closed
+                if index_extended and not middle_extended:
                     self.writing_mode = True
-                    self.current_path.append((ix, iy))
-                    # Draw a red circle around the index tip as cursor
-                    cv2.circle(annotated_frame, (ix, iy), 8, (0, 0, 255), -1)
+                    with self.canvas_lock:
+                        self.current_path.append((ix, iy))
+                    # Draw a high-tech red reticle cursor
+                    self._draw_hud_cursor(annotated_frame, (ix, iy), (0, 0, 255), writing=True)
                 else:
                     self.writing_mode = False
-                    if self.current_path:
-                        self.draw_paths.append(self.current_path)
-                        self.current_path = []
+                    with self.canvas_lock:
+                        if self.current_path:
+                            self.draw_paths.append(self.current_path)
+                            self.current_path = []
                     
-                    # 2. Clear Mode: All fingers extended (open hand)
-                    if index_extended and middle_extended and ring_extended and pinky_extended:
-                        self.draw_paths = []
-                        self.current_path = []
+                    # 2. Clear Mode: Index, Middle, and Ring all extended (open hand)
+                    if index_extended and middle_extended and ring_extended:
+                        with self.canvas_lock:
+                            self.draw_paths = []
+                            self.current_path = []
                         cv2.putText(annotated_frame, "CLEAR CANVAS", (w - 220, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
                     else:
-                        # Draw a blue circle to show hover cursor
-                        cv2.circle(annotated_frame, (ix, iy), 6, (255, 0, 0), -1)
+                        # 3. Hover Mode: Index and Middle extended, Ring closed
+                        # Draw a high-tech blue reticle cursor
+                        self._draw_hud_cursor(annotated_frame, (ix, iy), (255, 0, 0), writing=False)
                         
                 # Draw hand skeleton (premium cyan/white neon)
-                mp_draw = mp.solutions.drawing_utils
-                mp_draw.draw_landmarks(
-                    annotated_frame, 
-                    hand_landmarks, 
-                    self.mp_hands.HAND_CONNECTIONS,
-                    mp_draw.DrawingSpec(color=(255, 229, 0), thickness=2, circle_radius=2), # Cyan outline
-                    mp_draw.DrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=1) # White connections
-                )
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (9, 10), (10, 11), (11, 12),
+                    (13, 14), (14, 15), (15, 16),
+                    (0, 17), (17, 18), (18, 19), (19, 20),
+                    (5, 9), (9, 13), (13, 17)
+                ]
+                for start_idx, end_idx in connections:
+                    lm_start = landmarks[start_idx]
+                    lm_end = landmarks[end_idx]
+                    pt1 = (int(lm_start.x * w), int(lm_start.y * h))
+                    pt2 = (int(lm_end.x * w), int(lm_end.y * h))
+                    cv2.line(annotated_frame, pt1, pt2, (255, 229, 0), 2, lineType=cv2.LINE_AA)
+                for lm in landmarks:
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(annotated_frame, (cx, cy), 3, (255, 255, 255), -1)
         else:
             self.writing_mode = False
-            if self.current_path:
-                self.draw_paths.append(self.current_path)
-                self.current_path = []
-                
-        # Draw all existing paths on annotated_frame
-        for path in self.draw_paths:
-            for i in range(1, len(path)):
-                cv2.line(annotated_frame, path[i-1], path[i], (0, 255, 0), 4, lineType=cv2.LINE_AA)
-                
-        # Draw current path
-        for i in range(1, len(self.current_path)):
-            cv2.line(annotated_frame, self.current_path[i-1], self.current_path[i], (0, 255, 0), 4, lineType=cv2.LINE_AA)
+            self.last_cursor = None
+            with self.canvas_lock:
+                if self.current_path:
+                    self.draw_paths.append(self.current_path)
+                    self.current_path = []
+                    
+        self._render_drawings(annotated_frame)
 
-        # Draw HUD writing instructions
-        cv2.rectangle(annotated_frame, (20, 20), (520, 50), (22, 27, 38), -1)
-        cv2.rectangle(annotated_frame, (20, 20), (520, 50), (0, 229, 255), 1)
-        cv2.putText(
-            annotated_frame, 
-            "AIR WRITING ACTIVE // INDEX UP = WRITE, OPEN HAND = CLEAR", 
-            (30, 40), 
-            cv2.FONT_HERSHEY_SIMPLEX, 
-            0.4, 
-            (0, 229, 255), 
-            1, 
-            cv2.LINE_AA
-        )
+    def _render_drawings(self, annotated_frame):
+        # Draw all existing paths on annotated_frame
+        with self.canvas_lock:
+            for path in self.draw_paths:
+                for i in range(1, len(path)):
+                    cv2.line(annotated_frame, path[i-1], path[i], self.brush_color, self.brush_thickness, lineType=cv2.LINE_AA)
+
+            # Draw current path
+            for i in range(1, len(self.current_path)):
+                cv2.line(annotated_frame, self.current_path[i-1], self.current_path[i], self.brush_color, self.brush_thickness, lineType=cv2.LINE_AA)
+
+        # Only show HUD instruction when air writing is active
+        if self.air_writing_enabled:
+            cv2.rectangle(annotated_frame, (20, 20), (520, 50), (22, 27, 38), -1)
+            cv2.rectangle(annotated_frame, (20, 20), (520, 50), (0, 229, 255), 1)
+            cv2.putText(
+                annotated_frame,
+                "AIR WRITING ON // INDEX UP=WRITE  INDEX+MID=HOVER  OPEN HAND=CLEAR",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 229, 255),
+                1,
+                cv2.LINE_AA
+            )
 
     def _process_mood_detection(self, frame_rgb, annotated_frame, active_metadata):
-        # Run Face Mesh
+        if self.face_detector is None:
+            return
+        # Run Face Mesh via Tasks API
         h, w, _ = annotated_frame.shape
-        results = self.face_mesh.process(frame_rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        results = self.face_detector.detect(mp_image)
         
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                landmarks = face_landmarks.landmark
+        if results.face_landmarks:
+            for face_landmarks in results.face_landmarks:
+                landmarks = face_landmarks
                 
                 # 1. Extract Key Coordinates
                 m_left = landmarks[61]
@@ -923,15 +1391,42 @@ class InferenceEngine(QThread):
                 }
                 color = color_map.get(mood, (0, 229, 255))
                 
-                # Draw box around face
-                cv2.rectangle(annotated_frame, (min_x, min_y), (max_x, max_y), color, 1)
+                # 4. Face Recognition Matching
+                nose = landmarks[4]
+                ref_w = np.sqrt((landmarks[33].x - landmarks[263].x)**2 + (landmarks[33].y - landmarks[263].y)**2)
+                if ref_w < 1e-5:
+                    ref_w = 1.0
                 
-                label_text = f"MOOD: {mood.upper()}"
-                (t_w, t_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                cv2.rectangle(annotated_frame, (min_x, min_y - t_h - 6), (min_x + t_w + 10, min_y), color, -1)
-                cv2.putText(annotated_frame, label_text, (min_x + 5, min_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-                
-                # Map face mood to the tracked person
+                key_indices = [33, 263, 61, 291, 159, 386, 0, 17, 70, 300]
+                descriptor = []
+                for idx in key_indices:
+                    lm = landmarks[idx]
+                    dist = np.sqrt((lm.x - nose.x)**2 + (lm.y - nose.y)**2) / ref_w
+                    descriptor.append(dist)
+                    
+                matched_name = "Unknown"
+                min_diff = 0.25
+                for profile in self.face_registry_profiles:
+                    reg_descriptor = profile["landmarks"]
+                    diff = np.sqrt(sum((a - b)**2 for a, b in zip(descriptor, reg_descriptor)))
+                    if diff < min_diff:
+                        min_diff = diff
+                        matched_name = profile["name"]
+                        
+                # Enroll current face if requested
+                if self.register_face_name:
+                    self.db.register_face(self.register_face_name, descriptor)
+                    self.register_face_name = ""
+                    self.face_registry_profiles = self.db.get_face_registry()
+                    
+                # Draw box around face and labels
+                label_lines = [
+                    f"USER: {matched_name.upper()}",
+                    f"MOOD: {mood.upper()}"
+                ]
+                draw_glowing_hud_box(annotated_frame, min_x, min_y, max_x, max_y, color, label_lines)
+
+                # Map face mood and user_name to the tracked person
                 face_center_x = (min_x + max_x) / 2.0
                 face_center_y = (min_y + max_y) / 2.0
                 for track_id, info in active_metadata.items():
@@ -939,6 +1434,7 @@ class InferenceEngine(QThread):
                     tx, ty, tw, th = bbox
                     if tx <= face_center_x <= tx + tw and ty <= face_center_y <= ty + th:
                         info["mood"] = mood
+                        info["user_name"] = matched_name
 
     def _generate_synthetic_frame(self, tick):
         """Generates a high-tech synthetic surveillance frame with moving shapes."""
@@ -1017,5 +1513,7 @@ class InferenceEngine(QThread):
             filename = f"surveillance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             filepath = os.path.join(self.recordings_dir, filename)
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, 30.0, (w, h))
+            # Use dynamic current FPS of the engine (clamped to realistic values)
+            rec_fps = max(1.0, min(60.0, self.current_fps))
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, rec_fps, (w, h))
         self.video_writer.write(frame)

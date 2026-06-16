@@ -8,8 +8,12 @@ from datetime import datetime
 class DatabaseLogger:
     def __init__(self, db_path=None):
         if db_path is None:
-            # Locate db in the database folder of the workspace
-            db_dir = os.path.dirname(os.path.abspath(__file__))
+            # Locate db in the database folder of the workspace, or next to exe if frozen
+            import sys
+            if getattr(sys, 'frozen', False):
+                db_dir = os.path.join(os.path.dirname(sys.executable), "database")
+            else:
+                db_dir = os.path.dirname(os.path.abspath(__file__))
             self.db_path = os.path.join(db_dir, "nexus_events.db")
         else:
             self.db_path = db_path
@@ -24,7 +28,7 @@ class DatabaseLogger:
         self.worker_thread.start()
 
     def init_db(self):
-        """Initializes the database and creates the event logs table."""
+        """Initializes the database and creates all tables."""
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -43,10 +47,49 @@ class DatabaseLogger:
             )
         """)
         
+        # Create users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL
+            )
+        """)
+        
+        # Create audit logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                username TEXT NOT NULL,
+                action TEXT NOT NULL
+            )
+        """)
+        
+        # Create face registry table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS face_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                landmarks_blob TEXT NOT NULL,
+                registered_at TEXT NOT NULL
+            )
+        """)
+        
         # Create indexes for optimized queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON event_logs (timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_object_name ON event_logs (object_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs (timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_face_name ON face_registry (name)")
         
+        # Seed default admin user (username: admin, password: admin)
+        import hashlib
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            admin_hash = hashlib.sha256(b"admin").hexdigest()
+            cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("admin", admin_hash, "admin"))
+            
         conn.commit()
         conn.close()
 
@@ -118,3 +161,103 @@ class DatabaseLogger:
         """Stops the worker thread and commits any remaining logs."""
         self.is_running = False
         self.worker_thread.join(timeout=3.0)
+
+    # ================= SECURITY & FACIAL REGISTRY HELPERS =================
+
+    def log_audit(self, username: str, action: str):
+        """Logs a security action/event to the audit table."""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+                INSERT INTO audit_logs (timestamp, username, action)
+                VALUES (?, ?, ?)
+            """, (timestamp, username, action))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[DatabaseLogger] Audit logging failed: {e}")
+
+    def verify_user(self, username: str, password: str) -> bool:
+        """Verifies if the username and password match any database record."""
+        try:
+            import hashlib
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                is_valid = (row[0] == password_hash)
+                self.log_audit(username, "Login Attempt: SUCCESS" if is_valid else "Login Attempt: FAILURE (Wrong Password)")
+                return is_valid
+            self.log_audit(username, "Login Attempt: FAILURE (User Not Found)")
+            return False
+        except Exception as e:
+            print(f"[DatabaseLogger] User verification failed: {e}")
+            return False
+
+    def register_user(self, username: str, password: str, role: str = "user") -> bool:
+        """Registers a new user inside the database."""
+        try:
+            import hashlib
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            cursor.execute("""
+                INSERT INTO users (username, password_hash, role)
+                VALUES (?, ?, ?)
+            """, (username, password_hash, role))
+            conn.commit()
+            conn.close()
+            self.log_audit(username, f"User Registered successfully (Role: {role})")
+            return True
+        except Exception as e:
+            print(f"[DatabaseLogger] User registration failed: {e}")
+            return False
+
+    def register_face(self, name: str, landmarks_list: list) -> bool:
+        """Registers a face footprint in the database registry."""
+        try:
+            import json
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            landmarks_blob = json.dumps(landmarks_list)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+                INSERT INTO face_registry (name, landmarks_blob, registered_at)
+                VALUES (?, ?, ?)
+            """, (name, landmarks_blob, timestamp))
+            conn.commit()
+            conn.close()
+            self.log_audit("system", f"Registered new face for: {name}")
+            return True
+        except Exception as e:
+            print(f"[DatabaseLogger] Face registration failed: {e}")
+            return False
+
+    def get_face_registry(self) -> list:
+        """Retrieves all registered face profiles."""
+        try:
+            import json
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, landmarks_blob FROM face_registry")
+            rows = cursor.fetchall()
+            conn.close()
+            
+            registry = []
+            for name, blob in rows:
+                try:
+                    registry.append({
+                        "name": name,
+                        "landmarks": json.loads(blob)
+                    })
+                except Exception:
+                    pass
+            return registry
+        except Exception as e:
+            print(f"[DatabaseLogger] Fetching face registry failed: {e}")
+            return []

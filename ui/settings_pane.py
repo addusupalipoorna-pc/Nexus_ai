@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
     QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QFileDialog, 
-    QSlider, QGroupBox, QFormLayout, QLineEdit
+    QSlider, QGroupBox, QFormLayout, QLineEdit, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -11,15 +11,41 @@ class SettingsPane(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.clear_requested = False
+        self.enroll_requested = False
         self.init_ui()
 
     def init_ui(self):
+        # Create main layout for the SettingsPane widget
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Create the scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        # Apply transparent style to the scroll area and its viewport
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: transparent;
+            }
+        """)
+        
+        # Create container widget for the scroll area
+        scroll_content = QWidget()
+        scroll_content.setObjectName("scroll_content")
+        
+        # The actual layout for the settings fields
         layout = QVBoxLayout()
         layout.setSpacing(15)
         layout.setContentsMargins(15, 15, 15, 15)
 
         # Style QWidget components (Obsidian theme)
-        self.setStyleSheet("""
+        scroll_content.setStyleSheet("""
             QWidget {
                 background-color: #0B0F19;
                 color: #e2e8f0;
@@ -117,7 +143,7 @@ class SettingsPane(QWidget):
 
         self.source_combo = QComboBox()
         self.source_combo.addItems(["Synthetic Simulator", "USB Local Webcam", "Local Video File", "IP RTSP Camera Stream"])
-        self.source_combo.setCurrentIndex(0)  # Default: Synthetic Simulator
+        self.source_combo.setCurrentIndex(1)  # Default: USB Local Webcam
         self.source_combo.currentIndexChanged.connect(self.toggle_source_inputs)
         source_layout.addRow("Video Stream Input:", self.source_combo)
 
@@ -127,6 +153,12 @@ class SettingsPane(QWidget):
         self.webcam_spin.setValue(0)
         self.webcam_spin.valueChanged.connect(self.toggle_source_inputs)
         source_layout.addRow("Local Device Index:", self.webcam_spin)
+
+        # Camera Backend select
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItems(["Auto-Negotiate", "Media Foundation (MSMF)", "DirectShow (DSHOW)"])
+        self.backend_combo.setCurrentIndex(0)
+        source_layout.addRow("Camera Driver Backend:", self.backend_combo)
 
         # Video File path / RTSP URL LineEdit
         file_widget = QWidget()
@@ -178,24 +210,130 @@ class SettingsPane(QWidget):
 
         # 3. GUI Visualization switches
         vis_group = QGroupBox("Visual HUD Toggles")
-        vis_layout = QVBoxLayout()
+        vis_layout = QFormLayout()
         vis_layout.setSpacing(12)
         vis_layout.setContentsMargins(15, 20, 15, 15)
 
         self.cb_trails = QCheckBox("Render Fading Bounding Box Trails")
         self.cb_trails.setChecked(True)
-        vis_layout.addWidget(self.cb_trails)
+        vis_layout.addRow("", self.cb_trails)
 
         self.cb_labels = QCheckBox("Draw Classification Labels & Scores")
         self.cb_labels.setChecked(True)
-        vis_layout.addWidget(self.cb_labels)
+        vis_layout.addRow("", self.cb_labels)
 
         self.cb_intrusion = QCheckBox("Superimpose Polygon Intrusion Zone")
         self.cb_intrusion.setChecked(True)
-        vis_layout.addWidget(self.cb_intrusion)
+        vis_layout.addRow("", self.cb_intrusion)
+
+        self.cb_multicam = QCheckBox("Enable Multi-Camera Surveillance Wall (2x2 Grid)")
+        self.cb_multicam.setChecked(False)
+        vis_layout.addRow("", self.cb_multicam)
+
+        self.cb_heatmap = QCheckBox("Superimpose AI Activity Density Heatmap")
+        self.cb_heatmap.setChecked(False)
+        vis_layout.addRow("", self.cb_heatmap)
 
         vis_group.setLayout(vis_layout)
         layout.addWidget(vis_group)
+
+        # 4. Air Writing Canvas settings
+        canvas_group = QGroupBox("Air Writing Canvas Designer")
+        canvas_layout = QFormLayout()
+        canvas_layout.setSpacing(10)
+        canvas_layout.setContentsMargins(15, 20, 15, 15)
+        
+        self.color_combo = QComboBox()
+        self.color_combo.addItems([
+            "Neon Green",
+            "Electric Cyan", 
+            "Hot Pink", 
+            "Crimson Red", 
+            "Sun Yellow", 
+            "Bright White"
+        ])
+        self.color_combo.setCurrentIndex(0)
+        canvas_layout.addRow("Brush Color:", self.color_combo)
+        
+        self.brush_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brush_size_slider.setRange(1, 15)
+        self.brush_size_slider.setValue(4)
+        self.brush_size_slider.valueChanged.connect(self.update_brush_size_label)
+        
+        self.brush_size_val_label = QLabel("4 px")
+        self.brush_size_val_label.setStyleSheet("color: #00E5FF; font-weight: bold; font-size: 13px;")
+        
+        size_h_widget = QWidget()
+        size_h_layout = QHBoxLayout()
+        size_h_layout.setContentsMargins(0, 0, 0, 0)
+        size_h_layout.addWidget(self.brush_size_slider, 1)
+        size_h_layout.addWidget(self.brush_size_val_label)
+        size_h_widget.setLayout(size_h_layout)
+        canvas_layout.addRow("Brush Size:", size_h_widget)
+        
+        self.btn_clear_canvas = QPushButton("CLEAR WRITING CANVAS")
+        self.btn_clear_canvas.clicked.connect(self.clear_canvas_action)
+        self.btn_clear_canvas.setStyleSheet("background-color: rgba(239, 68, 68, 0.2); border: 1px solid #EF4444; color: #EF4444; padding: 6px; font-weight: bold;")
+        canvas_layout.addRow(self.btn_clear_canvas)
+        
+        canvas_group.setLayout(canvas_layout)
+        layout.addWidget(canvas_group)
+
+        # 5. Face registry settings
+        face_group = QGroupBox("Facial Recognition Registry")
+        face_layout = QFormLayout()
+        face_layout.setSpacing(10)
+        face_layout.setContentsMargins(15, 20, 15, 15)
+        
+        self.face_name_input = QLineEdit()
+        self.face_name_input.setPlaceholderText("Enter subject name...")
+        face_layout.addRow("Enroll Name:", self.face_name_input)
+        
+        self.btn_enroll_face = QPushButton("ENROLL FACE LANDMARKS")
+        self.btn_enroll_face.clicked.connect(self.enroll_face_action)
+        self.btn_enroll_face.setStyleSheet("background-color: rgba(0, 229, 255, 0.2); border: 1px solid #00E5FF; color: #00E5FF; padding: 6px; font-weight: bold;")
+        face_layout.addRow(self.btn_enroll_face)
+        
+        face_group.setLayout(face_layout)
+        layout.addWidget(face_group)
+
+        # 6. Notifier settings
+        notifier_group = QGroupBox("NEXUS AI Alert Dispatcher")
+        notifier_layout = QFormLayout()
+        notifier_layout.setSpacing(10)
+        notifier_layout.setContentsMargins(15, 20, 15, 15)
+        
+        self.telegram_token_input = QLineEdit()
+        self.telegram_token_input.setPlaceholderText("Enter Telegram Bot Token...")
+        notifier_layout.addRow("Telegram Bot Token:", self.telegram_token_input)
+        
+        self.telegram_chat_id_input = QLineEdit()
+        self.telegram_chat_id_input.setPlaceholderText("Enter Telegram Chat ID...")
+        notifier_layout.addRow("Telegram Chat ID:", self.telegram_chat_id_input)
+        
+        self.email_smtp_server_input = QLineEdit("smtp.gmail.com")
+        notifier_layout.addRow("SMTP Server:", self.email_smtp_server_input)
+        
+        self.email_smtp_port_spin = QSpinBox()
+        self.email_smtp_port_spin.setRange(1, 65535)
+        self.email_smtp_port_spin.setValue(587)
+        notifier_layout.addRow("SMTP Port:", self.email_smtp_port_spin)
+        
+        self.email_sender_input = QLineEdit()
+        self.email_sender_input.setPlaceholderText("sender@example.com")
+        notifier_layout.addRow("Email Sender Address:", self.email_sender_input)
+        
+        self.email_password_input = QLineEdit()
+        self.email_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.email_password_input.setPlaceholderText("Sender app password...")
+        notifier_layout.addRow("Email Sender Password:", self.email_password_input)
+        
+        self.email_recipient_input = QLineEdit()
+        self.email_recipient_input.setPlaceholderText("recipient@example.com")
+        notifier_layout.addRow("Email Recipient Address:", self.email_recipient_input)
+        
+        notifier_group.setLayout(notifier_layout)
+        layout.addWidget(notifier_group)
 
         # Save Settings
         self.apply_btn = QPushButton("COMMIT CORE SETTINGS")
@@ -203,7 +341,14 @@ class SettingsPane(QWidget):
         layout.addWidget(self.apply_btn)
         
         layout.addStretch()
-        self.setLayout(layout)
+        scroll_content.setLayout(layout)
+        scroll_area.setWidget(scroll_content)
+        
+        main_layout.addWidget(scroll_area)
+        self.setLayout(main_layout)
+        
+        # Align all labels across group boxes for perfect visual alignment
+        self.align_labels()
         
         # Initialize input toggles
         self.toggle_source_inputs()
@@ -211,10 +356,24 @@ class SettingsPane(QWidget):
     def update_conf_label(self, val):
         self.conf_val_label.setText(f"{val/100.0:.2f}")
 
+    def update_brush_size_label(self, val):
+        self.brush_size_val_label.setText(f"{val} px")
+
+    def clear_canvas_action(self):
+        self.clear_requested = True
+        self.dispatch_settings()
+        self.clear_requested = False
+
+    def enroll_face_action(self):
+        self.enroll_requested = True
+        self.dispatch_settings()
+        self.enroll_requested = False
+
     def toggle_source_inputs(self):
         index = self.source_combo.currentIndex()
         # 0: Synthetic, 1: Webcam, 2: File, 3: RTSP
         self.webcam_spin.setEnabled(index == 1)
+        self.backend_combo.setEnabled(index == 1)
         self.path_input.setEnabled(index in [2, 3])
         self.browse_btn.setEnabled(index == 2)
         if index == 1:
@@ -245,13 +404,60 @@ class SettingsPane(QWidget):
         elif idx == 3:
             source_type = "rtsp"
             source_path = self.path_input.text()
+
+        # Color mapping (BGR format for OpenCV drawing)
+        color_map = {
+            "Neon Green": (0, 255, 0),
+            "Electric Cyan": (255, 229, 0),
+            "Hot Pink": (180, 0, 255),
+            "Crimson Red": (60, 0, 255),
+            "Sun Yellow": (0, 229, 255),
+            "Bright White": (255, 255, 255)
+        }
+        selected_color_name = self.color_combo.currentText()
+        selected_color_bgr = color_map.get(selected_color_name, (0, 255, 0))
             
+        backend_map = {
+            0: "auto",
+            1: "msmf",
+            2: "dshow"
+        }
+        camera_backend = backend_map.get(self.backend_combo.currentIndex(), "auto")
+
         settings = {
             "source_type": source_type,
             "source_path": source_path,
+            "camera_backend": camera_backend,
             "conf_threshold": self.conf_slider.value() / 100.0,
             "show_trails": self.cb_trails.isChecked(),
             "show_labels": self.cb_labels.isChecked(),
-            "show_intrusion": self.cb_intrusion.isChecked()
+            "show_intrusion": self.cb_intrusion.isChecked(),
+            "multi_camera": self.cb_multicam.isChecked(),
+            "show_heatmap": self.cb_heatmap.isChecked(),
+            "brush_color": selected_color_bgr,
+            "brush_thickness": self.brush_size_slider.value(),
+            "clear_canvas": self.clear_requested,
+            "register_face_name": self.face_name_input.text().strip() if self.enroll_requested else "",
+            "telegram_token": self.telegram_token_input.text().strip(),
+            "telegram_chat_id": self.telegram_chat_id_input.text().strip(),
+            "email_smtp_server": self.email_smtp_server_input.text().strip(),
+            "email_smtp_port": self.email_smtp_port_spin.value(),
+            "email_sender": self.email_sender_input.text().strip(),
+            "email_password": self.email_password_input.text(),
+            "email_recipient": self.email_recipient_input.text().strip()
         }
         self.settings_changed.emit(settings)
+
+    def align_labels(self):
+        """Standardizes all form layout label column widths and right-aligns them for perfect alignment."""
+        for group_box in self.findChildren(QGroupBox):
+            layout = group_box.layout()
+            if isinstance(layout, QFormLayout):
+                layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+                for row in range(layout.rowCount()):
+                    label_item = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                    if label_item:
+                        widget = label_item.widget()
+                        if widget:
+                            widget.setMinimumWidth(160)
+                            widget.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
